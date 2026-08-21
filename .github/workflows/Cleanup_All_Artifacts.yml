@@ -1,0 +1,36 @@
+name: Cleanup All Artifacts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Delete all artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Listing all artifacts..."
+
+          gh api --paginate \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | [.id, .name, .size_in_bytes] | @tsv' |
+          while IFS=$'\t' read -r id name size; do
+            echo "Deleting artifact:"
+            echo "  ID:   $id"
+            echo "  Name: $name"
+            echo "  Size: $size bytes"
+
+            gh api \
+              --method DELETE \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${{ github.repository }}/actions/artifacts/$id"
+          done
+
+          echo "All artifacts have been deleted."
