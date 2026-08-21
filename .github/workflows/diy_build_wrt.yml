@@ -1,6 +1,7 @@
-name: DIY Build WRT
 # Code by ChatGPT  本工作流编译固件并Upload Build Artifact，如果本工作流编译成功可以继续执行发布固件的工作流。
 # 拆分是为了应对编译成功但发布固件前意外报错的情况，可以不再编译直接尝试后面的步骤。
+
+name: DIY Build WRT
 
 run-name: Build - ${{ inputs.model }}
 
@@ -56,6 +57,7 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
+
       - name: Free Disk Space
         run: |
           sudo rm -rf /usr/local/lib/android || true
@@ -190,17 +192,36 @@ jobs:
         run: |
           ./build.sh ${{ inputs.model }}
 
+      # ==========================================================
+      # 最关键的一步：
+      # 编译成功后立即保存 firmware。
+      # 后面的任何步骤失败，都不会影响这个 Artifact。
+      # ==========================================================
+
+      - name: Upload Firmware Artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: wrt-firmware-${{ github.run_id }}
+          path: ./firmware
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
       - name: Get Kernel Version
         run: |
-          MANIFEST=$(find ./firmware -maxdepth 1 -type f -name "*.manifest" | head -n 1)
+          MANIFEST=$(find ./firmware \
+            -maxdepth 1 \
+            -type f \
+            -name "*.manifest" |
+            head -n 1)
+
+          KVER="unknown"
 
           if [ -n "$MANIFEST" ]; then
             KVER=$(grep -oP "^kernel\.\*" "$MANIFEST" |
               grep -oP "[4-6]\.[0-9]{1,3}\.[0-9]{1,3}" |
               head -n 1 || true)
           fi
-
-          KVER=${KVER:-unknown}
 
           echo "KVER=$KVER" >> "$GITHUB_ENV"
 
@@ -240,39 +261,85 @@ jobs:
 
           echo "===================================================="
 
-      - name: Prepare Build Artifact
+      - name: Package Kmods
         run: |
           set -e
 
-          rm -rf ./release_artifact
-
-          mkdir -p ./release_artifact/firmware
-          mkdir -p ./release_artifact/kmods
-          mkdir -p ./release_artifact/metadata
-
-          echo "Copying firmware..."
-
-          if [ ! -d "./firmware" ]; then
-            echo "ERROR: ./firmware does not exist."
+          if [ ! -d "./action_build/bin" ]; then
+            echo "kmod source directory not found: ./action_build/bin" >&2
             exit 1
           fi
 
-          cp -a ./firmware/. ./release_artifact/firmware/
+          KMOD_LIST=$(mktemp)
+          trap 'rm -f "$KMOD_LIST"' EXIT
 
-          echo "Copying kmod packages..."
+          (
+            cd ./action_build/bin
 
-          if [ -d "./action_build/bin" ]; then
-            find ./action_build/bin \
-              -type f \
+            find . -type f \
               \( -name "kmod*.ipk" -o -name "kmod*.apk" \) \
-              -exec cp --parents {} ./release_artifact/kmods/ \;
+              -print |
+              sort > "$KMOD_LIST"
+          )
+
+          if [ ! -s "$KMOD_LIST" ]; then
+            echo "No kmod packages found under ./action_build/bin" >&2
+            exit 1
           fi
 
-          cat > ./release_artifact/metadata/build-info.env <<EOF
+          KMOD_COUNT=$(wc -l < "$KMOD_LIST" | tr -d '[:space:]')
+
+          ARCHIVE_NAME="kmods_${{ inputs.model }}_${KVER:-unknown-kernel}_${BUILD_DATE}.tar.gz"
+
+          tar \
+            -C ./action_build/bin \
+            -czf "$ARCHIVE_NAME" \
+            -T "$KMOD_LIST"
+
+          echo "KMOD_ARCHIVE=$ARCHIVE_NAME" >> "$GITHUB_ENV"
+
+          echo "Packaged $KMOD_COUNT kmod packages into $ARCHIVE_NAME"
+
+      - name: Package OpenWrt Firmware
+        if: ${{ inputs.model == 'n1_immwrt' }}
+        uses: unifreq/openwrt_packit@8007d3efd49bb42aa20c5755a50af21dc7a438e1
+        env:
+          OPENWRT_ARMVIRT: firmware/*.tar.gz
+          PACKAGE_SOC: s905d
+          KERNEL_VERSION_NAME: 6.6.y
+          WHOAMI: ZqinKing
+
+      - name: Prepare Release Body
+        run: |
+          echo "云编译发布" > release_body.txt
+          echo "源码：${BUILD_SRC}" >> release_body.txt
+          echo "Kernel: ${KVER}" >> release_body.txt
+          echo "WIFI密码: 12345678" >> release_body.txt
+          echo "LAN地址: 192.168.1.1" >> release_body.txt
+          echo "KMOD归档: ${KMOD_ARCHIVE:-未生成}" >> release_body.txt
+          echo "插件：" >> release_body.txt
+
+          MANIFEST=$(find ./firmware \
+            -maxdepth 1 \
+            -type f \
+            -name "*.manifest" |
+            head -n 1)
+
+          if [ -n "$MANIFEST" ]; then
+            grep -oP "luci-app(-[a-zA-Z0-9]{1,}){1,}" "$MANIFEST" |
+              awk -F":" '{print $NF}' >> release_body.txt || true
+          fi
+
+      - name: Upload Build Metadata
+        if: ${{ success() }}
+        run: |
+          mkdir -p ./build_metadata
+
+          cat > ./build_metadata/build-info.env <<EOF
           MODEL=${{ inputs.model }}
           BUILD_DATE=${BUILD_DATE}
           BUILD_SRC=${BUILD_SRC}
-          KVER=${KVER}
+          KVER=${KVER:-unknown}
           REPO_FLAG_HASH=${REPO_FLAG_HASH}
           BUILD_RUN_ID=${{ github.run_id }}
           BUILD_RUN_NUMBER=${{ github.run_number }}
@@ -280,26 +347,17 @@ jobs:
           REMOVE_CONFIG_FRAGMENTS=${{ inputs.remove_fragments }}
           EOF
 
-          echo "================ Artifact Contents ================"
+          cp release_body.txt ./build_metadata/release_body.txt
 
-          find ./release_artifact -type f | sort
-
-          echo "===================================================="
-
-          echo "Firmware size:"
-          du -sh ./release_artifact/firmware || true
-
-          echo "Kmods size:"
-          du -sh ./release_artifact/kmods || true
-
-      - name: Upload Build Artifact
+      - name: Upload Build Metadata Artifact
+        if: ${{ success() }}
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: wrt-build-${{ github.run_id }}
-          path: ./release_artifact
+          name: wrt-metadata-${{ github.run_id }}
+          path: ./build_metadata
           if-no-files-found: error
-          retention-days: 30
-          compression-level: 1
+          retention-days: 14
+          compression-level: 6
 
       - name: Build Summary
         run: |
@@ -310,10 +368,10 @@ jobs:
             echo "|---|---|"
             echo "| Model | \`${{ inputs.model }}\` |"
             echo "| Build Date | \`${BUILD_DATE}\` |"
-            echo "| Kernel | \`${KVER}\` |"
+            echo "| Kernel | \`${KVER:-unknown}\` |"
             echo "| Build Run ID | \`${{ github.run_id }}\` |"
             echo "| Source | \`${BUILD_SRC}\` |"
-            echo "| Artifact | \`wrt-build-${{ github.run_id }}\` |"
+            echo "| Firmware Artifact | \`wrt-firmware-${{ github.run_id }}\` |"
             echo
-            echo "The firmware has been saved as a GitHub Actions Artifact."
+            echo "Firmware has been saved as an Artifact."
           } >> "$GITHUB_STEP_SUMMARY"
