@@ -209,8 +209,7 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.release_info.outputs.tag_name }}
-          name: ImmortalWRT ${{ steps.release_info.outputs.tag_name }}
+          name: WRT ${{ steps.release_info.outputs.tag_name }}
           body_path: release_notes.md
           files: release/*
-          target_commitish: ${{ steps.verify.outputs.build_sha }}
           generate_release_notes: false
