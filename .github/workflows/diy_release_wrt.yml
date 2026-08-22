@@ -1,53 +1,48 @@
 # 仅根据“diy_build_wrt.yml”编译结果发布固件。
 # 只需要找到这次 Build 的 Run ID，重新运行 DIY Release WRT，输入这个 Run ID，它会直接取已经编译好的固件，不会再次运行 ./build.sh。
+#  Run ID 从查看结束的工作流的URL中可以找到。
+# 注意 Verify Build Workflow这一步中，BUILD_WORKFLOW_FILE="diy_build_wrt.yml"（上一个工作流文件名） 需根据实际情况更改
 
 name: DIY Release WRT
 
-run-name: Release - ${{ inputs.run_id || github.event.workflow_run.id }}
-
 on:
-  workflow_dispatch:
-    inputs:
-      run_id:
-        required: true
-        description: Build Workflow Run ID
-        type: string
-
   workflow_run:
     workflows:
-      - DIY Build WRT
+      -  DIY Build WRT
     types:
       - completed
 
-permissions:
-  actions: read
-  contents: write
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Build Workflow Run ID"
+        required: true
+        type: string
 
-env:
-  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+permissions:
+  contents: write
+  actions: read
 
 jobs:
   release:
+    name: Release WRT
+    runs-on: ubuntu-latest
+
     if: >
       github.event_name == 'workflow_dispatch' ||
-      (
-        github.event_name == 'workflow_run' &&
-        github.event.workflow_run.conclusion == 'success'
-      )
-
-    runs-on: ubuntu-24.04
+      github.event.workflow_run.conclusion == 'success'
 
     steps:
-
-      - name: Checkout
-        uses: actions/checkout@v7.0.0
-
-      - name: Determine Build Run ID
+      - name: Set Build Run ID
+        id: build_run
+        shell: bash
         run: |
-          if [ -n "${{ inputs.run_id }}" ]; then
-            BUILD_RUN_ID="${{ inputs.run_id }}"
-          else
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
             BUILD_RUN_ID="${{ github.event.workflow_run.id }}"
+          else
+            BUILD_RUN_ID="${{ inputs.run_id }}"
           fi
 
           if ! [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]; then
@@ -55,323 +50,167 @@ jobs:
             exit 1
           fi
 
-          echo "BUILD_RUN_ID=$BUILD_RUN_ID" >> "$GITHUB_ENV"
-
           echo "Build Run ID: $BUILD_RUN_ID"
 
+          echo "build_run_id=$BUILD_RUN_ID" >> "$GITHUB_OUTPUT"
+
       - name: Verify Build Workflow
+        id: verify
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ steps.build_run.outputs.build_run_id }}
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          RUN_INFO=$(gh run view "$BUILD_RUN_ID" \
-            --json name,status,conclusion,headBranch,headSha,createdAt,updatedAt)
+          BUILD_WORKFLOW_FILE="diy_build_wrt.yml"
 
-          echo "$RUN_INFO"
+          echo "========================================"
+          echo "Verify Build Workflow"
+          echo "Build Run ID: $BUILD_RUN_ID"
+          echo "Build Workflow: $BUILD_WORKFLOW_FILE"
+          echo "========================================"
 
-          WORKFLOW_NAME=$(echo "$RUN_INFO" | jq -r '.name')
-          CONCLUSION=$(echo "$RUN_INFO" | jq -r '.conclusion')
+          # 获取 Build Workflow ID
+          BUILD_WORKFLOW_ID=$(gh api \
+            "/repos/${{ github.repository }}/actions/workflows/${BUILD_WORKFLOW_FILE}" \
+            --jq '.id')
 
-          if [ "$WORKFLOW_NAME" != "DIY Build WRT" ]; then
-            echo "ERROR: The specified Run ID is not from DIY Build WRT."
+          if [ -z "$BUILD_WORKFLOW_ID" ] || [ "$BUILD_WORKFLOW_ID" = "null" ]; then
+            echo "ERROR: Cannot find $BUILD_WORKFLOW_FILE"
             exit 1
           fi
 
-          if [ "$CONCLUSION" != "success" ]; then
-            echo "ERROR: Build workflow did not complete successfully."
-            echo "Conclusion: $CONCLUSION"
+          # 获取指定 Run 的信息
+          RUN_INFO=$(gh api \
+            "/repos/${{ github.repository }}/actions/runs/${BUILD_RUN_ID}")
+
+          RUN_WORKFLOW_ID=$(echo "$RUN_INFO" | jq -r '.workflow_id')
+          RUN_STATUS=$(echo "$RUN_INFO" | jq -r '.status')
+          RUN_CONCLUSION=$(echo "$RUN_INFO" | jq -r '.conclusion')
+          RUN_BRANCH=$(echo "$RUN_INFO" | jq -r '.head_branch')
+          RUN_SHA=$(echo "$RUN_INFO" | jq -r '.head_sha')
+          RUN_NAME=$(echo "$RUN_INFO" | jq -r '.name')
+
+          echo "Workflow Name:   $RUN_NAME"
+          echo "Workflow ID:     $RUN_WORKFLOW_ID"
+          echo "Expected ID:     $BUILD_WORKFLOW_ID"
+          echo "Status:          $RUN_STATUS"
+          echo "Conclusion:      $RUN_CONCLUSION"
+          echo "Branch:          $RUN_BRANCH"
+          echo "Commit SHA:      $RUN_SHA"
+
+          # 确认 Run 属于 diy_build_wrt.yml
+          if [ "$RUN_WORKFLOW_ID" != "$BUILD_WORKFLOW_ID" ]; then
+            echo "ERROR: The specified Run ID is not from $BUILD_WORKFLOW_FILE."
             exit 1
           fi
 
-      - name: Download Firmware Artifact
+          # 确认 Build 已完成
+          if [ "$RUN_STATUS" != "completed" ]; then
+            echo "ERROR: Build Workflow is not completed."
+            exit 1
+          fi
+
+          # 确认 Build 成功
+          if [ "$RUN_CONCLUSION" != "success" ]; then
+            echo "ERROR: Build Workflow failed."
+            exit 1
+          fi
+
+          echo "Build Workflow verification successful."
+
+          echo "build_branch=$RUN_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "build_sha=$RUN_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Download Build Artifacts
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ steps.build_run.outputs.build_run_id }}
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          rm -rf ./downloaded_firmware
+          mkdir -p artifacts
 
-          mkdir -p ./downloaded_firmware
-
-          ARTIFACT_NAME="wrt-firmware-${BUILD_RUN_ID}"
-
-          echo "Downloading Artifact:"
-          echo "$ARTIFACT_NAME"
+          echo "Downloading artifacts from Build Run $BUILD_RUN_ID..."
 
           gh run download "$BUILD_RUN_ID" \
-            --name "$ARTIFACT_NAME" \
-            --dir ./downloaded_firmware
+            --repo "${{ github.repository }}" \
+            --dir artifacts
 
-          echo "================ Firmware Artifact ================"
+          echo "========================================"
+          echo "Downloaded files:"
+          echo "========================================"
 
-          find ./downloaded_firmware -type f | sort
+          find artifacts -type f -print
 
-          echo "===================================================="
-
-          if ! find ./downloaded_firmware -type f | grep -q .; then
-            echo "ERROR: Firmware Artifact is empty."
-            exit 1
-          fi
-
-      - name: Download Metadata Artifact
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Prepare Release Files
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          rm -rf ./downloaded_metadata
+          mkdir -p release
 
-          mkdir -p ./downloaded_metadata
+          echo "Searching firmware files..."
 
-          ARTIFACT_NAME="wrt-metadata-${BUILD_RUN_ID}"
+          find artifacts -type f \
+            \( \
+              -name "*.bin" \
+              -o -name "*.manifest" \
+              -o -name "*.img" \
+              -o -name "*.itb" \
+              -o -name "*.gz" \
+              -o -name "*.xz" \
+              -o -name "*.zip" \
+            \) \
+            -exec cp -v {} release/ \;
 
-          echo "Downloading Artifact:"
-          echo "$ARTIFACT_NAME"
+          echo "========================================"
+          echo "Release files:"
+          echo "========================================"
 
-          if gh run download "$BUILD_RUN_ID" \
-            --name "$ARTIFACT_NAME" \
-            --dir ./downloaded_metadata; then
+          ls -lh release
 
-            echo "Metadata Artifact downloaded."
-
-          else
-
-            echo "WARNING: Metadata Artifact is unavailable."
-            echo "Release will continue using firmware files."
-
-          fi
-
-      - name: Load Build Metadata
-        run: |
-          set -e
-
-          INFO_FILE="./downloaded_metadata/build-info.env"
-
-          if [ -f "$INFO_FILE" ]; then
-
-            echo "================ Build Metadata ================"
-
-            cat "$INFO_FILE"
-
-            echo "================================================="
-
-            set -a
-            source "$INFO_FILE"
-            set +a
-
-            echo "MODEL=$MODEL" >> "$GITHUB_ENV"
-            echo "BUILD_DATE=$BUILD_DATE" >> "$GITHUB_ENV"
-            echo "BUILD_SRC=$BUILD_SRC" >> "$GITHUB_ENV"
-            echo "KVER=$KVER" >> "$GITHUB_ENV"
-
-          else
-
-            echo "Metadata not found."
-
-            echo "MODEL=unknown" >> "$GITHUB_ENV"
-            echo "BUILD_DATE=$(date +"%y.%m.%d_%H.%M.%S")" >> "$GITHUB_ENV"
-            echo "BUILD_SRC=unknown" >> "$GITHUB_ENV"
-            echo "KVER=unknown" >> "$GITHUB_ENV"
-
-          fi
-
-      - name: Prepare Firmware Directory
-        run: |
-          set -e
-
-          rm -rf ./firmware
-
-          mkdir -p ./firmware
-
-          cp -a ./downloaded_firmware/. ./firmware/
-
-          echo "================ Firmware Files ================"
-
-          find ./firmware -maxdepth 1 -type f -print | sort
-
-          echo "================================================="
-
-          if ! find ./firmware -maxdepth 1 -type f | grep -q .; then
+          if [ -z "$(find release -type f -print -quit)" ]; then
             echo "ERROR: No firmware files found."
             exit 1
           fi
 
-      - name: Prepare Kmod Directory
+      - name: Create Release Information
+        id: release_info
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          rm -rf ./action_build
+          BUILD_RUN_ID="${{ steps.build_run.outputs.build_run_id }}"
+          BUILD_SHA="${{ steps.verify.outputs.build_sha }}"
 
-          mkdir -p ./action_build/bin
+          VERSION=$(date -u '+%Y.%m.%d-%H%M')
 
-          echo "Kmod directory prepared."
+          TAG_NAME="v${VERSION}-run${BUILD_RUN_ID}"
 
-      - name: Package Kmods
-        run: |
-          set -e
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
 
-          if [ ! -d "./action_build/bin" ]; then
-            echo "ERROR: kmod source directory not found."
-            exit 1
-          fi
+          cat > release_notes.md << EOF
+          ## ImmortalWRT Firmware
 
-          KMOD_LIST=$(mktemp)
+          - Build Run ID: ${BUILD_RUN_ID}
+          - Build Workflow: diy_build_wrt.yml
+          - Branch: ${{ steps.verify.outputs.build_branch }}
+          - Commit: ${BUILD_SHA}
 
-          trap 'rm -f "$KMOD_LIST"' EXIT
+          Firmware generated by GitHub Actions.
+          EOF
 
-          (
-            cd ./action_build/bin
+          echo "Release tag: $TAG_NAME"
 
-            find . -type f \
-              \( -name "kmod*.ipk" -o -name "kmod*.apk" \) \
-              -print |
-              sort > "$KMOD_LIST"
-          )
-
-          if [ ! -s "$KMOD_LIST" ]; then
-            echo "WARNING: No kmod packages were included in the firmware Artifact."
-
-            echo "KMOD_ARCHIVE=" >> "$GITHUB_ENV"
-
-            exit 0
-          fi
-
-          KMOD_COUNT=$(wc -l < "$KMOD_LIST" | tr -d '[:space:]')
-
-          ARCHIVE_NAME="kmods_${MODEL}_${KVER:-unknown-kernel}_${BUILD_DATE}.tar.gz"
-
-          tar \
-            -C ./action_build/bin \
-            -czf "$ARCHIVE_NAME" \
-            -T "$KMOD_LIST"
-
-          echo "KMOD_ARCHIVE=$ARCHIVE_NAME" >> "$GITHUB_ENV"
-
-          echo "Packaged $KMOD_COUNT kmod packages."
-
-      - name: Package OpenWrt Firmware
-        if: ${{ env.MODEL == 'n1_immwrt' }}
-        uses: unifreq/openwrt_packit@8007d3efd49bb42aa20c5755a50af21dc7a438e1
-        env:
-          OPENWRT_ARMVIRT: firmware/*.tar.gz
-          PACKAGE_SOC: s905d
-          KERNEL_VERSION_NAME: 6.6.y
-          WHOAMI: ZqinKing
-
-      - name: Prepare Release Body
-        run: |
-          set -e
-
-          if [ -f "./downloaded_metadata/release_body.txt" ]; then
-
-            cp "./downloaded_metadata/release_body.txt" ./release_body.txt
-
-          else
-
-            echo "云编译发布" > release_body.txt
-            echo "源码：${BUILD_SRC}" >> release_body.txt
-            echo "Kernel: ${KVER}" >> release_body.txt
-            echo "WIFI密码: 12345678" >> release_body.txt
-            echo "LAN地址: 192.168.1.1" >> release_body.txt
-
-            if [ -n "${KMOD_ARCHIVE:-}" ]; then
-              echo "KMOD归档: ${KMOD_ARCHIVE}" >> release_body.txt
-            fi
-
-            echo "插件：" >> release_body.txt
-
-            MANIFEST=$(find ./firmware \
-              -maxdepth 1 \
-              -type f \
-              -name "*.manifest" |
-              head -n 1)
-
-            if [ -n "$MANIFEST" ]; then
-              grep -oP "luci-app(-[a-zA-Z0-9]{1,}){1,}" "$MANIFEST" |
-                awk -F":" '{print $NF}' >> release_body.txt || true
-            fi
-
-          fi
-
-          if [ -n "${KMOD_ARCHIVE:-}" ]; then
-            echo "KMOD归档: ${KMOD_ARCHIVE}" >> release_body.txt
-          fi
-
-          echo "================ Release Body ================"
-
-          cat release_body.txt
-
-          echo "==============================================="
-
-      - name: Determine Release Files
-        run: |
-          set -e
-
-          rm -f ./release_files.txt
-
-          if [ "$MODEL" = "n1_immwrt" ] &&
-             [ -n "${PACKAGED_OUTPUTPATH:-}" ] &&
-             [ -d "$PACKAGED_OUTPUTPATH" ]; then
-
-            echo "Using N1 packaged output:"
-            echo "$PACKAGED_OUTPUTPATH"
-
-            find "$PACKAGED_OUTPUTPATH" \
-              -maxdepth 1 \
-              -type f \
-              -print >> release_files.txt
-
-          else
-
-            find ./firmware \
-              -maxdepth 1 \
-              -type f \
-              -print >> release_files.txt
-
-          fi
-
-          if [ -n "${KMOD_ARCHIVE:-}" ] &&
-             [ -f "./${KMOD_ARCHIVE}" ]; then
-
-            echo "./${KMOD_ARCHIVE}" >> release_files.txt
-
-          fi
-
-          echo "================ Release Files ================"
-
-          cat release_files.txt
-
-          echo "================================================"
-
-          if [ ! -s release_files.txt ]; then
-            echo "ERROR: Release file list is empty."
-            exit 1
-          fi
-
-      - name: Release Firmware
-        uses: softprops/action-gh-release@v3.0.1
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ env.BUILD_DATE }}_${{ env.MODEL }}
-          files: |
-            ${{ env.MODEL == 'n1_immwrt' && env.PACKAGED_OUTPUTPATH || './firmware' }}/*.*
-            ./kmods_*.tar.gz
-          fail_on_unmatched_files: false
-          body_path: ./release_body.txt
-
-      - name: Release Summary
-        run: |
-          {
-            echo "## OpenWrt Release Completed"
-            echo
-            echo "| Item | Value |"
-            echo "|---|---|"
-            echo "| Model | \`${MODEL}\` |"
-            echo "| Build Date | \`${BUILD_DATE}\` |"
-            echo "| Kernel | \`${KVER}\` |"
-            echo "| Build Run ID | \`${BUILD_RUN_ID}\` |"
-            echo "| Source | \`${BUILD_SRC}\` |"
-            echo "| Release Tag | \`${BUILD_DATE}_${MODEL}\` |"
-            echo
-            echo "Firmware was released without rebuilding OpenWrt."
-          } >> "$GITHUB_STEP_SUMMARY"
+          tag_name: ${{ steps.release_info.outputs.tag_name }}
+          name: ImmortalWRT ${{ steps.release_info.outputs.tag_name }}
+          body_path: release_notes.md
+          files: release/*
+          target_commitish: ${{ steps.verify.outputs.build_sha }}
+          generate_release_notes: false
